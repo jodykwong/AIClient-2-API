@@ -10,3 +10,17 @@ token-store.json
 usage-cache.json
 *_oauth_creds.json
 *-auth-token.json
+
+# Environment files (security)
+.env
+.env.*
+!.env.example
+
+# Password file (security)
+configs/pwd
+
+# Logs
+*.log
+logs/*.log
+logs/*.log.*
+!logs/.gitkeep

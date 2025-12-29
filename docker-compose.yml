@@ -1,0 +1,181 @@
+version: '3.8'
+
+# AIClient-2-API Docker Compose 配置
+# 提供完整的 API 代理服务部署方案
+
+services:
+  # ========================================
+  # 主 API 服务
+  # ========================================
+  aiclient-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aiclient-2-api:latest
+    container_name: aiclient-api
+    restart: unless-stopped
+
+    # 端口映射
+    ports:
+      # 主 API 端口
+      - "${API_PORT:-3000}:3000"
+      # Web UI 端口
+      - "${WEB_UI_PORT:-8085}:8085"
+      # 管理后台端口（可选）
+      - "${ADMIN_PORT:-8086}:8086"
+      # 流式响应端口范围
+      - "${STREAM_PORT_START:-19876}:19876"
+      - "${STREAM_PORT_RANGE:-19876-19880}:19876-19880"
+
+    # 环境变量配置
+    environment:
+      # 服务端口
+      SERVER_PORT: ${SERVER_PORT:-3000}
+      HOST: ${HOST:-0.0.0.0}
+
+      # Web UI 配置
+      WEB_UI_PORT: ${WEB_UI_PORT:-8085}
+      ENABLE_WEB_UI: ${ENABLE_WEB_UI:-true}
+
+      # API 配置
+      API_TIMEOUT: ${API_TIMEOUT:-30000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+      # 账号池配置（可选）
+      PROVIDER_POOLS_ENABLED: ${PROVIDER_POOLS_ENABLED:-false}
+      PROVIDER_POOLS_FILE_PATH: ${PROVIDER_POOLS_FILE_PATH:-/app/configs/provider_pools.json}
+
+      # 其他环境变量（根据需要添加）
+      NODE_ENV: ${NODE_ENV:-production}
+      TZ: ${TZ:-UTC}
+
+    # 卷挂载
+    volumes:
+      # 配置文件目录（重要：2025.12.25 更新）
+      - ${CONFIG_PATH:-./configs}:/app/configs
+      # Kiro OAuth 凭证目录（用于 Kiro API 多账号池）
+      - ${CREDENTIALS_PATH:-./credentials}:/app/credentials
+      # 日志目录（可选）
+      - ${LOG_PATH:-./logs}:/app/logs
+      # 缓存目录（可选）
+      - ${CACHE_PATH:-./cache}:/app/cache
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "node", "healthcheck.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    # 资源限制（可选，根据实际需求调整）
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "10"
+        labels: "service=aiclient-api"
+
+    # 网络配置
+    networks:
+      - aiclient-network
+
+    # 长时间不活动时不关闭连接
+    stdin_open: true
+    tty: true
+
+  # ========================================
+  # Redis 缓存服务（可选）
+  # ========================================
+  redis:
+    image: redis:7-alpine
+    container_name: aiclient-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis123}
+
+    volumes:
+      - redis_data:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - aiclient-network
+
+    # 仅当显式启用时才启动
+    profiles:
+      - with-redis
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ========================================
+  # 监控服务（可选）
+  # ========================================
+  # 使用 Portainer 进行容器管理和监控
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: aiclient-portainer
+    restart: unless-stopped
+
+    ports:
+      - "${PORTAINER_PORT:-9000}:9000"
+      - "${PORTAINER_EDGE_PORT:-8000}:8000"
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+
+    networks:
+      - aiclient-network
+
+    environment:
+      TZ: ${TZ:-UTC}
+
+    # 仅当显式启用时才启动
+    profiles:
+      - with-portainer
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+# ========================================
+# 数据卷定义
+# ========================================
+volumes:
+  redis_data:
+    driver: local
+  portainer_data:
+    driver: local
+
+# ========================================
+# 网络定义
+# ========================================
+networks:
+  aiclient-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

@@ -1,0 +1,38 @@
+# Systemd service for token synchronization
+# Installation:
+#   sudo cp scripts/systemd/token-sync.service /etc/systemd/system/
+#   sudo cp scripts/systemd/token-sync.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable token-sync.timer
+#   sudo systemctl start token-sync.timer
+
+[Unit]
+Description=AIClient2API Token Synchronization Service
+After=network.target
+
+[Service]
+Type=oneshot
+User=sunrise
+Group=sunrise
+WorkingDirectory=/home/sunrise/AIClient-2-API
+
+# Load environment variables if config file exists
+EnvironmentFile=-/home/sunrise/AIClient-2-API/scripts/token-sync.env
+
+# Run the sync script
+ExecStart=/home/sunrise/AIClient-2-API/scripts/sync-tokens.sh sync
+
+# Restart policy
+Restart=on-failure
+RestartSec=30
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Logging
+StandardOutput=append:/home/sunrise/AIClient-2-API/logs/token-sync-systemd.log
+StandardError=append:/home/sunrise/AIClient-2-API/logs/token-sync-systemd.log
+
+[Install]
+WantedBy=multi-user.target

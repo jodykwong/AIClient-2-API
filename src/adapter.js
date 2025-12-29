@@ -6,6 +6,7 @@ import { ClaudeApiService } from './claude/claude-core.js'; // 导入ClaudeApiSe
 import { KiroApiService } from './claude/claude-kiro.js'; // 导入KiroApiService
 import { QwenApiService } from './openai/qwen-core.js'; // 导入QwenApiService
 import { MODEL_PROVIDER } from './common.js'; // 导入 MODEL_PROVIDER
+import { EventEmitter } from 'events'; // 导入事件发射器
 
 // 定义AI服务适配器接口
 // 所有的服务适配器都应该实现这些方法
@@ -254,6 +255,8 @@ export class KiroApiServiceAdapter extends ApiServiceAdapter {
     constructor(config) {
         super();
         this.kiroApiService = new KiroApiService(config);
+        this.config = config;
+        this.eventEmitter = new EventEmitter(); // 事件发射器用于广播token过期事件
         // this.kiroApiService.initialize().catch(error => {
         //     console.error("Failed to initialize kiroApiService:", error);
         // });
@@ -265,7 +268,13 @@ export class KiroApiServiceAdapter extends ApiServiceAdapter {
             console.warn("kiroApiService not initialized, attempting to re-initialize...");
             await this.kiroApiService.initialize();
         }
-        return this.kiroApiService.generateContent(model, requestBody);
+        try {
+            return await this.kiroApiService.generateContent(model, requestBody);
+        } catch (error) {
+            // Check if error is related to refreshToken expiration
+            this._handleTokenError(error);
+            throw error;
+        }
     }
 
     async *generateContentStream(model, requestBody) {
@@ -274,8 +283,14 @@ export class KiroApiServiceAdapter extends ApiServiceAdapter {
             console.warn("kiroApiService not initialized, attempting to re-initialize...");
             await this.kiroApiService.initialize();
         }
-        const stream = this.kiroApiService.generateContentStream(model, requestBody);
-        yield* stream;
+        try {
+            const stream = this.kiroApiService.generateContentStream(model, requestBody);
+            yield* stream;
+        } catch (error) {
+            // Check if error is related to refreshToken expiration
+            this._handleTokenError(error);
+            throw error;
+        }
     }
 
     async listModels() {
@@ -288,9 +303,28 @@ export class KiroApiServiceAdapter extends ApiServiceAdapter {
     }
 
     async refreshToken() {
+        // Check if refreshToken itself is near expiration or has failed
+        const refreshTokenStatus = this.kiroApiService.isRefreshTokenNearExpiry();
+        if (refreshTokenStatus.isNear) {
+            console.warn(`[Kiro Adapter] RefreshToken issue detected: ${refreshTokenStatus.reason}`);
+            // Emit event for potential re-authorization
+            this._emitRefreshTokenExpiry(refreshTokenStatus);
+            // Don't attempt to refresh if refreshToken has failed
+            if (refreshTokenStatus.hasFailed) {
+                console.error('[Kiro Adapter] RefreshToken has failed, skipping refresh attempt');
+                return Promise.resolve();
+            }
+        }
+
+        // Check if accessToken is near expiration
         if(this.kiroApiService.isExpiryDateNear()===true){
-            console.log(`[Kiro] Expiry date is near, refreshing token...`);
-            return this.kiroApiService.initializeAuth(true);
+            console.log(`[Kiro Adapter] AccessToken expiry date is near, refreshing token...`);
+            try {
+                return await this.kiroApiService.initializeAuth(true);
+            } catch (error) {
+                this._handleTokenError(error);
+                throw error;
+            }
         }
         return Promise.resolve();
     }
@@ -305,6 +339,69 @@ export class KiroApiServiceAdapter extends ApiServiceAdapter {
             await this.kiroApiService.initialize();
         }
         return this.kiroApiService.getUsageLimits();
+    }
+
+    /**
+     * 处理token相关错误，检测并广播refreshToken过期事件
+     * @private
+     * @param {Error} error - 捕获的错误对象
+     */
+    _handleTokenError(error) {
+        const errorMessage = error.message || '';
+
+        // Check if error indicates refreshToken expiration
+        if (errorMessage.includes('RefreshToken expired or invalid') ||
+            errorMessage.includes('400') ||
+            this.kiroApiService.refreshTokenFailedAt) {
+
+            console.error('[Kiro Adapter] RefreshToken error detected, emitting expiry event');
+
+            const refreshTokenStatus = this.kiroApiService.isRefreshTokenNearExpiry();
+            this._emitRefreshTokenExpiry(refreshTokenStatus);
+        }
+    }
+
+    /**
+     * 广播refreshToken过期事件
+     * @private
+     * @param {Object} status - refreshToken状态对象
+     */
+    _emitRefreshTokenExpiry(status) {
+        const eventData = {
+            uuid: this.config.uuid,
+            provider: this.config.MODEL_PROVIDER,
+            status: status,
+            timestamp: new Date().toISOString(),
+            profileArn: this.kiroApiService.profileArn,
+            region: this.kiroApiService.region
+        };
+
+        console.log(`[Kiro Adapter] Emitting refreshToken expiry event:`, JSON.stringify(eventData, null, 2));
+        this.eventEmitter.emit('refreshTokenExpiry', eventData);
+    }
+
+    /**
+     * 获取refreshToken状态
+     * @returns {Object} refreshToken状态信息
+     */
+    getRefreshTokenStatus() {
+        return this.kiroApiService.isRefreshTokenNearExpiry();
+    }
+
+    /**
+     * 订阅refreshToken过期事件
+     * @param {Function} listener - 事件监听器函数
+     */
+    onRefreshTokenExpiry(listener) {
+        this.eventEmitter.on('refreshTokenExpiry', listener);
+    }
+
+    /**
+     * 取消订阅refreshToken过期事件
+     * @param {Function} listener - 事件监听器函数
+     */
+    offRefreshTokenExpiry(listener) {
+        this.eventEmitter.off('refreshTokenExpiry', listener);
     }
 
     /**

@@ -1,5 +1,6 @@
 import { getServiceAdapter, serviceInstances } from './adapter.js';
-import { ProviderPoolManager } from './provider-pool-manager.js';
+import { ProviderPoolManager, setBroadcastEventHandler } from './provider-pool-manager.js';
+import { broadcastEvent } from './ui-manager.js';
 import deepmerge from 'deepmerge';
 import * as fs from 'fs';
 import { promises as pfs } from 'fs';
@@ -167,6 +168,11 @@ export async function initApiService(config) {
             providerFallbackChain: config.providerFallbackChain || {},
         });
         console.log('[Initialization] ProviderPoolManager initialized with configured pools.');
+
+        // 设置广播事件处理器，用于SSE通知
+        setBroadcastEventHandler(broadcastEvent);
+        console.log('[Initialization] Broadcast event handler configured for token expiry notifications.');
+
         // 健康检查将在服务器完全启动后执行
     } else {
         console.log('[Initialization] No provider pools configured. Using single provider mode.');

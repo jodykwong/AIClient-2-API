@@ -963,6 +963,24 @@
     <!-- Toast Notifications -->
     <div id="toastContainer" class="toast-container"></div>
 
+    <!-- Token Expiry Modal -->
+    <div id="tokenExpiryModal" class="modal" style="display: none;">
+        <div class="modal-overlay"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-exclamation-triangle"></i> Token过期通知</h3>
+            </div>
+            <div class="modal-body">
+                <div id="tokenExpiryList" class="token-expiry-list">
+                    <!-- Token expiry items will be dynamically added here -->
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="dismissTokenModal" class="btn btn-secondary">稍后处理</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Scripts -->
     <script type="module" src="app/i18n.js"></script>
     <script type="module" src="app/language-switcher.js"></script>
@@ -1037,6 +1055,226 @@
         // 导出到 window 供其他脚本使用
         window.initAuth = initAuth;
         window.logout = logout;
+
+        // Token Expiry Management
+        (function() {
+            const tokenExpiryModal = document.getElementById('tokenExpiryModal');
+            const tokenExpiryList = document.getElementById('tokenExpiryList');
+            const dismissTokenModal = document.getElementById('dismissTokenModal');
+
+            // Store providers needing reauth
+            const expiredProviders = new Map();
+
+            // Show token expiry modal
+            function showTokenExpiryModal() {
+                tokenExpiryModal.style.display = 'flex';
+            }
+
+            // Hide token expiry modal
+            function hideTokenExpiryModal() {
+                tokenExpiryModal.style.display = 'none';
+            }
+
+            // Add token expiry notification
+            function addTokenExpiry(eventData) {
+                const { providerType, uuid, status, timestamp, message } = eventData;
+                const key = `${providerType}-${uuid}`;
+
+                // Check if already displayed
+                if (expiredProviders.has(key)) {
+                    return;
+                }
+
+                expiredProviders.set(key, eventData);
+
+                // Create notification item
+                const item = document.createElement('div');
+                item.className = 'token-expiry-item';
+                item.dataset.key = key;
+                item.innerHTML = `
+                    <div class="token-expiry-header">
+                        <h4><i class="fas fa-key"></i> ${providerType}</h4>
+                        <span class="token-expiry-uuid">${uuid}</span>
+                    </div>
+                    <div class="token-expiry-info">
+                        <p class="token-expiry-reason"><strong>原因:</strong> ${status.reason}</p>
+                        ${status.daysRemaining !== null ? `<p><strong>剩余天数:</strong> ${status.daysRemaining} 天</p>` : ''}
+                        <p class="token-expiry-time"><strong>时间:</strong> ${new Date(timestamp).toLocaleString('zh-CN')}</p>
+                    </div>
+                    <div class="token-expiry-actions">
+                        <button class="btn btn-primary reauth-btn" data-provider-type="${providerType}" data-uuid="${uuid}">
+                            <i class="fas fa-sync-alt"></i> 重新授权
+                        </button>
+                        <button class="btn btn-danger dismiss-item-btn" data-key="${key}">
+                            <i class="fas fa-times"></i> 忽略
+                        </button>
+                    </div>
+                `;
+
+                tokenExpiryList.appendChild(item);
+
+                // Add event listeners
+                const reauthBtn = item.querySelector('.reauth-btn');
+                const dismissBtn = item.querySelector('.dismiss-item-btn');
+
+                reauthBtn.addEventListener('click', () => handleReauth(providerType, uuid));
+                dismissBtn.addEventListener('click', () => dismissTokenItem(key));
+
+                // Show modal
+                showTokenExpiryModal();
+
+                // Show toast notification
+                showToast(`Token即将过期: ${providerType} (${uuid})`, 'warning');
+            }
+
+            // Handle re-authorization
+            async function handleReauth(providerType, uuid) {
+                try {
+                    showToast(`正在获取重新授权链接...`, 'info');
+
+                    // Get OAuth link from backend
+                    const response = await fetch('/api/oauth-link', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${localStorage.getItem('authToken')}`
+                        },
+                        body: JSON.stringify({ providerType, uuid })
+                    });
+
+                    if (!response.ok) {
+                        throw new Error('获取授权链接失败');
+                    }
+
+                    const data = await response.json();
+
+                    // Open OAuth window
+                    const oauthWindow = window.open(data.authUrl, 'OAuth Authorization', 'width=600,height=700');
+
+                    // Monitor OAuth completion
+                    const checkInterval = setInterval(async () => {
+                        if (oauthWindow.closed) {
+                            clearInterval(checkInterval);
+
+                            // Check if reauth was successful
+                            showToast('正在验证授权状态...', 'info');
+
+                            // Wait a bit for token to be saved
+                            await new Promise(resolve => setTimeout(resolve, 2000));
+
+                            // Notify backend that reauth is complete
+                            try {
+                                const completeResponse = await fetch('/api/provider-reauth-complete', {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                        'Authorization': `Bearer ${localStorage.getItem('authToken')}`
+                                    },
+                                    body: JSON.stringify({ providerType, uuid })
+                                });
+
+                                if (completeResponse.ok) {
+                                    showToast('重新授权成功!', 'success');
+                                    const key = `${providerType}-${uuid}`;
+                                    dismissTokenItem(key);
+                                } else {
+                                    showToast('授权验证失败，请重试', 'error');
+                                }
+                            } catch (error) {
+                                console.error('Failed to mark reauth complete:', error);
+                                showToast('授权验证失败: ' + error.message, 'error');
+                            }
+                        }
+                    }, 1000);
+
+                } catch (error) {
+                    console.error('Reauth error:', error);
+                    showToast('重新授权失败: ' + error.message, 'error');
+                }
+            }
+
+            // Dismiss a single token expiry item
+            function dismissTokenItem(key) {
+                expiredProviders.delete(key);
+                const item = tokenExpiryList.querySelector(`[data-key="${key}"]`);
+                if (item) {
+                    item.remove();
+                }
+
+                // Hide modal if no more items
+                if (expiredProviders.size === 0) {
+                    hideTokenExpiryModal();
+                }
+            }
+
+            // Dismiss modal button
+            dismissTokenModal.addEventListener('click', hideTokenExpiryModal);
+
+            // Close modal on overlay click
+            tokenExpiryModal.querySelector('.modal-overlay').addEventListener('click', hideTokenExpiryModal);
+
+            // Listen for SSE token_expiry events
+            function listenForTokenExpiry() {
+                if (window.eventSource) {
+                    window.eventSource.addEventListener('token_expiry', (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            console.log('Received token_expiry event:', data);
+                            addTokenExpiry(data);
+                        } catch (error) {
+                            console.error('Failed to parse token_expiry event:', error);
+                        }
+                    });
+
+                    window.eventSource.addEventListener('reauth_complete', (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            console.log('Received reauth_complete event:', data);
+                            const key = `${data.providerType}-${data.uuid}`;
+                            dismissTokenItem(key);
+                            showToast(`授权已更新: ${data.providerType} (${data.uuid})`, 'success');
+                        } catch (error) {
+                            console.error('Failed to parse reauth_complete event:', error);
+                        }
+                    });
+                }
+            }
+
+            // Initialize when page loads
+            setTimeout(listenForTokenExpiry, 1000);
+
+            // Also check for providers needing reauth on page load
+            async function checkProvidersNeedingReauth() {
+                try {
+                    const response = await fetch('/api/providers-needing-reauth', {
+                        headers: {
+                            'Authorization': `Bearer ${localStorage.getItem('authToken')}`
+                        }
+                    });
+
+                    if (response.ok) {
+                        const data = await response.json();
+                        if (data.providers && data.providers.length > 0) {
+                            data.providers.forEach(provider => {
+                                addTokenExpiry({
+                                    providerType: provider.providerType,
+                                    uuid: provider.uuid,
+                                    status: provider.refreshTokenStatus,
+                                    timestamp: provider.lastReauthRequestTime,
+                                    message: `Provider needs re-authorization: ${provider.refreshTokenStatus.reason}`
+                                });
+                            });
+                        }
+                    }
+                } catch (error) {
+                    console.error('Failed to check providers needing reauth:', error);
+                }
+            }
+
+            // Check on page load
+            setTimeout(checkProvidersNeedingReauth, 2000);
+
+        })();
     </script>
     <script type="module" src="app/app.js"></script>
 </body>

@@ -1,0 +1,31 @@
+# Systemd timer for token synchronization
+# Runs token sync every 15 minutes
+# Installation:
+#   sudo cp scripts/systemd/token-sync.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable token-sync.timer
+#   sudo systemctl start token-sync.timer
+#
+# Check status:
+#   sudo systemctl status token-sync.timer
+#   sudo systemctl list-timers token-sync.timer
+
+[Unit]
+Description=AIClient2API Token Sync Timer
+Requires=token-sync.service
+
+[Timer]
+# Run every 15 minutes
+OnCalendar=*:0/15
+
+# Run 1 minute after boot
+OnBootSec=1min
+
+# If missed (system was off), run once immediately
+Persistent=true
+
+# Allow some randomization to avoid conflicts
+RandomizedDelaySec=30sec
+
+[Install]
+WantedBy=timers.target

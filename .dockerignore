@@ -1,21 +1,65 @@
+# Dependencies
 node_modules
 npm-debug.log
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Git
 .git
 .gitignore
+.github
+
+# Docker
 Dockerfile
+docker-compose.yml
+docker-compose.*.yml
 .dockerignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
 .nyc_output
 coverage
-.nyc_output
 .coverage
+tests/
+jest.config.js
+babel.config.js
+run-tests.js
+test-summary.js
+
+# Environment
 .env
 .env.local
 .env.*.local
+.env.example
+.env.docker
+
+# Credentials and secrets
 credentials.json
+*-auth-token.json
+*_oauth_creds.json
+token-store.json
+
+# Documentation
 *.md
 LICENSE
-jest.config.js
-babel.config.js
-tests/
-run-tests.js
-test-summary.js
+README*
+CHANGELOG*
+
+# Development
+logs/
+cache/
+.claude/
+.serena/
+
+# OS
+Thumbs.db
+.DS_Store
+*.log

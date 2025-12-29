@@ -308,6 +308,8 @@ export class KiroApiService {
 
         this.modelName = KIRO_CONSTANTS.DEFAULT_MODEL_NAME;
         this.axiosInstance = null; // Initialize later in async method
+        this.refreshTokenExpiresAt = null; // Track refreshToken expiration
+        this.refreshTokenFailedAt = null; // Track when refreshToken last failed
     }
  
     async initialize() {
@@ -461,6 +463,7 @@ async initializeAuth(forceRefresh = false) {
         this.expiresAt = this.expiresAt || mergedCredentials.expiresAt;
         this.profileArn = this.profileArn || mergedCredentials.profileArn;
         this.region = this.region || mergedCredentials.region;
+        this.refreshTokenExpiresAt = this.refreshTokenExpiresAt || mergedCredentials.refreshTokenExpiresAt;
 
         // Ensure region is set before using it in URLs
         if (!this.region) {
@@ -503,7 +506,15 @@ async initializeAuth(forceRefresh = false) {
                 const expiresIn = response.data.expiresIn;
                 const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
                 this.expiresAt = expiresAt;
+
+                // Estimate refreshToken expiration (AWS SSO refreshTokens typically expire in 90 days)
+                // Use config setting if available, otherwise default to 90 days
+                const refreshTokenLifetimeDays = this.config.KIRO_REFRESH_TOKEN_LIFETIME_DAYS || 90;
+                const refreshTokenExpiresAt = new Date(Date.now() + refreshTokenLifetimeDays * 24 * 60 * 60 * 1000).toISOString();
+                this.refreshTokenExpiresAt = refreshTokenExpiresAt;
+
                 console.info('[Kiro Auth] Access token refreshed successfully');
+                console.info(`[Kiro Auth] RefreshToken estimated to expire at: ${refreshTokenExpiresAt}`);
 
                 // Update the token file - use specified path if configured, otherwise use default
                 const tokenFilePath = this.credsFilePath || path.join(this.credPath, KIRO_AUTH_TOKEN_FILE);
@@ -511,6 +522,7 @@ async initializeAuth(forceRefresh = false) {
                     accessToken: this.accessToken,
                     refreshToken: this.refreshToken,
                     expiresAt: expiresAt,
+                    refreshTokenExpiresAt: refreshTokenExpiresAt,
                 };
                 if(this.profileArn){
                     updatedTokenData.profileArn = this.profileArn;
@@ -521,6 +533,14 @@ async initializeAuth(forceRefresh = false) {
             }
         } catch (error) {
             console.error('[Kiro Auth] Token refresh failed:', error.message);
+
+            // Detect 400 errors which typically indicate invalid/expired refreshToken
+            if (error.response?.status === 400) {
+                console.error('[Kiro Auth] Received 400 error - RefreshToken likely expired or invalid');
+                this.refreshTokenFailedAt = new Date().toISOString();
+                throw new Error(`RefreshToken expired or invalid: ${error.message}`);
+            }
+
             throw new Error(`Token refresh failed: ${error.message}`);
         }
     }
@@ -1012,6 +1032,20 @@ async initializeAuth(forceRefresh = false) {
             const response = await this.axiosInstance.post(requestUrl, requestData, { headers });
             return response;
         } catch (error) {
+            // Handle 400 errors - may indicate token issues
+            if (error.response?.status === 400) {
+                console.error('[Kiro] Received 400 Bad Request error');
+                // Check if error message indicates token issues
+                const errorMessage = error.response?.data?.message || error.message || '';
+                if (errorMessage.toLowerCase().includes('token') ||
+                    errorMessage.toLowerCase().includes('expired') ||
+                    errorMessage.toLowerCase().includes('invalid')) {
+                    console.error('[Kiro] 400 error appears to be token-related, marking refreshToken as potentially expired');
+                    this.refreshTokenFailedAt = new Date().toISOString();
+                }
+                throw error;
+            }
+
             if (error.response?.status === 403 && !isRetry) {
                 console.log('[Kiro] Received 403. Attempting token refresh and retrying...');
                 try {
@@ -1019,10 +1053,14 @@ async initializeAuth(forceRefresh = false) {
                     return this.callApi(method, model, body, true, retryCount);
                 } catch (refreshError) {
                     console.error('[Kiro] Token refresh failed during 403 retry:', refreshError.message);
+                    // Check if it's a 400 error from refresh (refreshToken expired)
+                    if (refreshError.message.includes('RefreshToken expired or invalid')) {
+                        console.error('[Kiro] RefreshToken is expired/invalid, re-authorization required');
+                    }
                     throw refreshError;
                 }
             }
-            
+
             // Handle 429 (Too Many Requests) with exponential backoff
             if (error.response?.status === 429 && retryCount < maxRetries) {
                 const delay = baseDelay * Math.pow(2, retryCount);
@@ -1307,14 +1345,37 @@ async initializeAuth(forceRefresh = false) {
             if (stream && typeof stream.destroy === 'function') {
                 stream.destroy();
             }
-            
+
+            // Handle 400 errors - may indicate token issues
+            if (error.response?.status === 400) {
+                console.error('[Kiro] Received 400 Bad Request error in stream');
+                // Check if error message indicates token issues
+                const errorMessage = error.response?.data?.message || error.message || '';
+                if (errorMessage.toLowerCase().includes('token') ||
+                    errorMessage.toLowerCase().includes('expired') ||
+                    errorMessage.toLowerCase().includes('invalid')) {
+                    console.error('[Kiro] 400 error appears to be token-related, marking refreshToken as potentially expired');
+                    this.refreshTokenFailedAt = new Date().toISOString();
+                }
+                throw error;
+            }
+
             if (error.response?.status === 403 && !isRetry) {
                 console.log('[Kiro] Received 403 in stream. Attempting token refresh and retrying...');
-                await this.initializeAuth(true);
-                yield* this.streamApiReal(method, model, body, true, retryCount);
-                return;
+                try {
+                    await this.initializeAuth(true);
+                    yield* this.streamApiReal(method, model, body, true, retryCount);
+                    return;
+                } catch (refreshError) {
+                    console.error('[Kiro] Token refresh failed during 403 retry in stream:', refreshError.message);
+                    // Check if it's a 400 error from refresh (refreshToken expired)
+                    if (refreshError.message.includes('RefreshToken expired or invalid')) {
+                        console.error('[Kiro] RefreshToken is expired/invalid, re-authorization required');
+                    }
+                    throw refreshError;
+                }
             }
-            
+
             if (error.response?.status === 429 && retryCount < maxRetries) {
                 const delay = baseDelay * Math.pow(2, retryCount);
                 console.log(`[Kiro] Received 429 in stream. Retrying in ${delay}ms...`);
@@ -1775,6 +1836,60 @@ async initializeAuth(forceRefresh = false) {
         } catch (error) {
             console.error(`[Kiro] Error checking expiry date: ${this.expiresAt}, Error: ${error.message}`);
             return false; // Treat as expired if parsing fails
+        }
+    }
+
+    /**
+     * Checks if the refreshToken is near expiration or has failed
+     * @returns {Object} - { isNear: boolean, daysRemaining: number, hasFailed: boolean, reason: string }
+     */
+    isRefreshTokenNearExpiry() {
+        const result = {
+            isNear: false,
+            daysRemaining: null,
+            hasFailed: false,
+            reason: null
+        };
+
+        // Check if refreshToken has previously failed
+        if (this.refreshTokenFailedAt) {
+            result.hasFailed = true;
+            result.isNear = true;
+            result.reason = 'RefreshToken has previously failed with 400 error';
+            return result;
+        }
+
+        // Check if refreshToken expiration date is near
+        if (!this.refreshTokenExpiresAt) {
+            result.reason = 'RefreshToken expiration date not set';
+            return result;
+        }
+
+        try {
+            const expirationTime = new Date(this.refreshTokenExpiresAt);
+            const currentTime = new Date();
+
+            // Check if near expiration (default: 7 days)
+            const nearExpiryDays = this.config.KIRO_REFRESH_TOKEN_NEAR_EXPIRY_DAYS || 7;
+            const thresholdTime = new Date(currentTime.getTime() + nearExpiryDays * 24 * 60 * 60 * 1000);
+
+            const daysRemaining = Math.floor((expirationTime.getTime() - currentTime.getTime()) / (24 * 60 * 60 * 1000));
+            result.daysRemaining = daysRemaining;
+
+            if (expirationTime.getTime() <= currentTime.getTime()) {
+                result.isNear = true;
+                result.reason = 'RefreshToken has expired';
+            } else if (expirationTime.getTime() <= thresholdTime.getTime()) {
+                result.isNear = true;
+                result.reason = `RefreshToken will expire in ${daysRemaining} days`;
+            }
+
+            console.log(`[Kiro] RefreshToken expiration check: ${JSON.stringify(result)}`);
+            return result;
+        } catch (error) {
+            console.error(`[Kiro] Error checking refreshToken expiry: ${error.message}`);
+            result.reason = `Error checking expiry: ${error.message}`;
+            return result;
         }
     }
 

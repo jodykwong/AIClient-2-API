@@ -1875,7 +1875,7 @@ export async function handleUIApiRequests(method, pathParam, req, res, currentCo
         try {
             // 调用重载配置函数
             const newConfig = await reloadConfig(providerPoolManager);
-            
+
             // 广播更新事件
             broadcastEvent('config_update', {
                 action: 'reload',
@@ -1883,7 +1883,7 @@ export async function handleUIApiRequests(method, pathParam, req, res, currentCo
                 providerPoolsPath: newConfig.PROVIDER_POOLS_FILE_PATH || null,
                 timestamp: new Date().toISOString()
             });
-            
+
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
                 success: true,
@@ -1901,6 +1901,96 @@ export async function handleUIApiRequests(method, pathParam, req, res, currentCo
             res.end(JSON.stringify({
                 error: {
                     message: '重新加载配置文件失败: ' + error.message
+                }
+            }));
+            return true;
+        }
+    }
+
+    // Get providers needing re-authorization
+    if (method === 'GET' && pathParam === '/api/providers-needing-reauth') {
+        try {
+            if (!providerPoolManager) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    error: {
+                        message: 'Provider pool manager not available'
+                    }
+                }));
+                return true;
+            }
+
+            const providersNeedingReauth = providerPoolManager.getProvidersNeedingReauth();
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                success: true,
+                providers: providersNeedingReauth,
+                count: providersNeedingReauth.length,
+                timestamp: new Date().toISOString()
+            }));
+            return true;
+        } catch (error) {
+            console.error('[UI API] Failed to get providers needing reauth:', error);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                error: {
+                    message: '获取需要重新授权的提供商失败: ' + error.message
+                }
+            }));
+            return true;
+        }
+    }
+
+    // Mark provider re-authorization as complete
+    if (method === 'POST' && pathParam === '/api/provider-reauth-complete') {
+        try {
+            if (!providerPoolManager) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    error: {
+                        message: 'Provider pool manager not available'
+                    }
+                }));
+                return true;
+            }
+
+            const body = await getRequestBody(req);
+            const { providerType, uuid } = body;
+
+            if (!providerType || !uuid) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    error: {
+                        message: '缺少必需参数: providerType 和 uuid'
+                    }
+                }));
+                return true;
+            }
+
+            providerPoolManager.clearProviderReauthFlag(providerType, uuid);
+
+            // 广播重新授权完成事件
+            broadcastEvent('reauth_complete', {
+                providerType,
+                uuid,
+                timestamp: new Date().toISOString()
+            });
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                success: true,
+                message: '重新授权标记已清除',
+                providerType,
+                uuid
+            }));
+            return true;
+        } catch (error) {
+            console.error('[UI API] Failed to mark reauth complete:', error);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                error: {
+                    message: '清除重新授权标记失败: ' + error.message
                 }
             }));
             return true;

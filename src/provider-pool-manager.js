@@ -4,6 +4,12 @@ import { MODEL_PROVIDER, getProtocolPrefix } from './common.js';
 import { getProviderModels } from './provider-models.js';
 import axios from 'axios';
 
+// Import broadcastEvent function for SSE notifications
+let broadcastEventFunc = null;
+export function setBroadcastEventHandler(handler) {
+    broadcastEventFunc = handler;
+}
+
 /**
  * Manages a pool of API service providers, handling their health and selection.
  */
@@ -28,19 +34,23 @@ export class ProviderPoolManager {
         // 使用 ?? 运算符确保 0 也能被正确设置，而不是被 || 替换为默认值
         this.maxErrorCount = options.maxErrorCount ?? 3; // Default to 3 errors before marking unhealthy
         this.healthCheckInterval = options.healthCheckInterval ?? 10 * 60 * 1000; // Default to 10 minutes
-        
+
         // 日志级别控制
         this.logLevel = options.logLevel || 'info'; // 'debug', 'info', 'warn', 'error'
-        
+
         // 添加防抖机制，避免频繁的文件 I/O 操作
         this.saveDebounceTime = options.saveDebounceTime || 1000; // 默认1秒防抖
         this.saveTimer = null;
         this.pendingSaves = new Set(); // 记录待保存的 providerType
-        
+
         // Fallback 链配置
         this.fallbackChain = options.globalConfig?.providerFallbackChain || {};
-        
+
+        // 存储服务适配器实例，用于订阅事件
+        this.serviceAdapters = {};
+
         this.initializeProviderStatus();
+        this._subscribeToAdapterEvents();
     }
 
     /**
@@ -83,16 +93,21 @@ export class ProviderPoolManager {
                 providerConfig.lastUsed = providerConfig.lastUsed !== undefined ? providerConfig.lastUsed : null;
                 providerConfig.usageCount = providerConfig.usageCount !== undefined ? providerConfig.usageCount : 0;
                 providerConfig.errorCount = providerConfig.errorCount !== undefined ? providerConfig.errorCount : 0;
-                
+
                 // 优化2: 简化 lastErrorTime 处理逻辑
                 providerConfig.lastErrorTime = providerConfig.lastErrorTime instanceof Date
                     ? providerConfig.lastErrorTime.toISOString()
                     : (providerConfig.lastErrorTime || null);
-                
+
                 // 健康检测相关字段
                 providerConfig.lastHealthCheckTime = providerConfig.lastHealthCheckTime || null;
                 providerConfig.lastHealthCheckModel = providerConfig.lastHealthCheckModel || null;
                 providerConfig.lastErrorMessage = providerConfig.lastErrorMessage || null;
+
+                // RefreshToken过期/重授权相关字段
+                providerConfig.needsReauth = providerConfig.needsReauth !== undefined ? providerConfig.needsReauth : false;
+                providerConfig.refreshTokenStatus = providerConfig.refreshTokenStatus || null;
+                providerConfig.lastReauthRequestTime = providerConfig.lastReauthRequestTime || null;
 
                 this.providerStatus[providerType].push({
                     config: providerConfig,
@@ -120,7 +135,7 @@ export class ProviderPoolManager {
 
         const availableProviders = this.providerStatus[providerType] || [];
         let availableAndHealthyProviders = availableProviders.filter(p =>
-            p.config.isHealthy && !p.config.isDisabled
+            p.config.isHealthy && !p.config.isDisabled && !p.config.needsReauth
         );
 
         // 如果指定了模型，则排除不支持该模型的提供商
@@ -665,14 +680,14 @@ export class ProviderPoolManager {
     async _flushPendingSaves() {
         const typesToSave = Array.from(this.pendingSaves);
         if (typesToSave.length === 0) return;
-        
+
         this.pendingSaves.clear();
         this.saveTimer = null;
-        
+
         try {
             const filePath = this.globalConfig.PROVIDER_POOLS_FILE_PATH || 'configs/provider_pools.json';
             let currentPools = {};
-            
+
             // 一次性读取文件
             try {
                 const fileContent = await fs.promises.readFile(filePath, 'utf8');
@@ -700,18 +715,162 @@ export class ProviderPoolManager {
                         if (config.lastHealthCheckTime instanceof Date) {
                             config.lastHealthCheckTime = config.lastHealthCheckTime.toISOString();
                         }
+                        if (config.lastReauthRequestTime instanceof Date) {
+                            config.lastReauthRequestTime = config.lastReauthRequestTime.toISOString();
+                        }
                         return config;
                     });
                 } else {
                     this._log('warn', `Attempted to save unknown providerType: ${providerType}`);
                 }
             }
-            
+
             // 一次性写入文件
             await fs.promises.writeFile(filePath, JSON.stringify(currentPools, null, 2), 'utf8');
             this._log('info', `configs/provider_pools.json updated successfully for types: ${typesToSave.join(', ')}`);
         } catch (error) {
             this._log('error', `Failed to write provider_pools.json: ${error.message}`);
+        }
+    }
+
+    /**
+     * 标记提供商需要重新授权
+     * @param {string} providerType - 提供商类型
+     * @param {string} uuid - 提供商UUID
+     * @param {Object} refreshTokenStatus - refreshToken状态信息
+     */
+    markProviderNeedsReauth(providerType, uuid, refreshTokenStatus) {
+        const provider = this._findProvider(providerType, uuid);
+        if (provider) {
+            provider.config.needsReauth = true;
+            provider.config.refreshTokenStatus = refreshTokenStatus;
+            provider.config.lastReauthRequestTime = new Date().toISOString();
+
+            this._log('warn', `Marked provider ${uuid} (${providerType}) as needing re-authorization: ${refreshTokenStatus.reason}`);
+            this._debouncedSave(providerType);
+        } else {
+            this._log('error', `Provider not found: ${uuid} (${providerType})`);
+        }
+    }
+
+    /**
+     * 清除提供商的重授权标记（重授权完成后调用）
+     * @param {string} providerType - 提供商类型
+     * @param {string} uuid - 提供商UUID
+     */
+    clearProviderReauthFlag(providerType, uuid) {
+        const provider = this._findProvider(providerType, uuid);
+        if (provider) {
+            provider.config.needsReauth = false;
+            provider.config.refreshTokenStatus = null;
+            provider.config.lastReauthRequestTime = null;
+
+            this._log('info', `Cleared re-authorization flag for provider ${uuid} (${providerType})`);
+            this._debouncedSave(providerType);
+        } else {
+            this._log('error', `Provider not found: ${uuid} (${providerType})`);
+        }
+    }
+
+    /**
+     * 获取需要重新授权的提供商列表
+     * @param {string} [providerType] - 可选，指定提供商类型；如果不指定，返回所有类型
+     * @returns {Array} 需要重新授权的提供商列表
+     */
+    getProvidersNeedingReauth(providerType = null) {
+        const result = [];
+
+        if (providerType) {
+            // 只查询指定类型
+            const providers = this.providerStatus[providerType] || [];
+            providers.forEach(p => {
+                if (p.config.needsReauth) {
+                    result.push({
+                        providerType,
+                        uuid: p.config.uuid,
+                        refreshTokenStatus: p.config.refreshTokenStatus,
+                        lastReauthRequestTime: p.config.lastReauthRequestTime
+                    });
+                }
+            });
+        } else {
+            // 查询所有类型
+            for (const type in this.providerStatus) {
+                const providers = this.providerStatus[type] || [];
+                providers.forEach(p => {
+                    if (p.config.needsReauth) {
+                        result.push({
+                            providerType: type,
+                            uuid: p.config.uuid,
+                            refreshTokenStatus: p.config.refreshTokenStatus,
+                            lastReauthRequestTime: p.config.lastReauthRequestTime
+                        });
+                    }
+                });
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * 订阅所有服务适配器的refreshToken过期事件
+     * @private
+     */
+    _subscribeToAdapterEvents() {
+        // 遍历所有provider配置，为支持refreshToken的provider订阅事件
+        for (const providerType in this.providerPools) {
+            // 只为支持token刷新的provider订阅事件（如Kiro, Gemini, Antigravity等）
+            if (providerType.includes('kiro') || providerType.includes('gemini') || providerType.includes('antigravity')) {
+                this.providerPools[providerType].forEach((providerConfig) => {
+                    try {
+                        const serviceAdapter = getServiceAdapter({
+                            ...providerConfig,
+                            MODEL_PROVIDER: providerType
+                        });
+
+                        // 存储适配器实例引用
+                        const adapterKey = `${providerType}-${providerConfig.uuid}`;
+                        this.serviceAdapters[adapterKey] = serviceAdapter;
+
+                        // 订阅refreshToken过期事件（如果适配器支持）
+                        if (typeof serviceAdapter.onRefreshTokenExpiry === 'function') {
+                            serviceAdapter.onRefreshTokenExpiry((eventData) => {
+                                this._handleRefreshTokenExpiry(eventData);
+                            });
+                            this._log('debug', `Subscribed to refreshToken expiry events for ${providerConfig.uuid} (${providerType})`);
+                        }
+                    } catch (error) {
+                        this._log('error', `Failed to subscribe to events for ${providerConfig.uuid} (${providerType}): ${error.message}`);
+                    }
+                });
+            }
+        }
+    }
+
+    /**
+     * 处理refreshToken过期事件
+     * @private
+     * @param {Object} eventData - 事件数据
+     */
+    _handleRefreshTokenExpiry(eventData) {
+        const { uuid, provider, status, timestamp } = eventData;
+
+        this._log('warn', `Received refreshToken expiry event for ${uuid} (${provider}): ${status.reason}`);
+
+        // 标记提供商需要重新授权
+        this.markProviderNeedsReauth(provider, uuid, status);
+
+        // 广播SSE事件到前端UI，通知用户需要重新授权
+        if (broadcastEventFunc) {
+            broadcastEventFunc('token_expiry', {
+                providerType: provider,
+                uuid: uuid,
+                status: status,
+                timestamp: timestamp,
+                message: `Provider ${uuid} (${provider}) needs re-authorization: ${status.reason}`
+            });
+            this._log('info', `Broadcasted token_expiry event for ${uuid} (${provider})`);
         }
     }
 
