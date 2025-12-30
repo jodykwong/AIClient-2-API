@@ -16,6 +16,12 @@ usage-cache.json
 .env.*
 !.env.example
 
+# Credentials (security - OAuth tokens)
+credentials/
+credentials/*.json
+credentials/*.backup
+*.backup
+
 # Password file (security)
 configs/pwd
 

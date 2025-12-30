@@ -1132,21 +1132,27 @@
                 try {
                     showToast(`正在获取重新授权链接...`, 'info');
 
-                    // Get OAuth link from backend
-                    const response = await fetch('/api/oauth-link', {
+                    // Get OAuth link from backend - 使用正确的端点
+                    const response = await fetch(`/api/providers/${encodeURIComponent(providerType)}/generate-auth-url`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
                             'Authorization': `Bearer ${localStorage.getItem('authToken')}`
                         },
-                        body: JSON.stringify({ providerType, uuid })
+                        body: JSON.stringify({ uuid })
                     });
 
                     if (!response.ok) {
-                        throw new Error('获取授权链接失败');
+                        const errorData = await response.json().catch(() => ({}));
+                        throw new Error(errorData.error || '获取授权链接失败');
                     }
 
                     const data = await response.json();
+
+                    // 检查返回数据格式
+                    if (!data.authUrl) {
+                        throw new Error('服务器未返回授权链接');
+                    }
 
                     // Open OAuth window
                     const oauthWindow = window.open(data.authUrl, 'OAuth Authorization', 'width=600,height=700');
